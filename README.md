@@ -14,6 +14,6 @@ A collection of reusable utilities, scripts, and helpers developed at Institute 
 
 Clone the repository:
 
-git clone https://github.com/I4R/utilities.git 
+git clone https://github.com/I4R/utilities.git \\
 cd utilities
 
