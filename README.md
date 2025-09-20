@@ -20,5 +20,5 @@ cd utilities
 Install dependencies:
 
 pip install -r requirements.txt
-# or
+or
 npm install
