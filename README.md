@@ -15,3 +15,6 @@ A collection of reusable utilities, scripts, and helpers developed at Institute 
 Clone the repository:
 
 git clone [https://github.com/I4R/utilities.git](https://github.com/I4Replication/utilities)
+
+Requirements for Finance and Economics Journal Scrapers
+Install with: pip install -r requirements.txt
