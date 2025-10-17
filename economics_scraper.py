@@ -23,8 +23,8 @@ class EconomicsJournalScraper:
         """Initialize with journal mappings for top 15 economics journals"""
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Academic Research Bot 1.0 (mailto:research@university.edu)',
-            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         })
 
         # Top 15 Economics Journals with their ISSNs
@@ -77,10 +77,112 @@ class EconomicsJournalScraper:
                                  'lobbying', 'conflict', 'war', 'governance']
         }
 
+    def verify_url_has_content(self, url: str) -> bool:
+        """Verify that a URL actually contains replication package content"""
+        try:
+            # Filter out API URLs and other non-replication URLs
+            excluded_patterns = [
+                'api.crossref.org/v1/works',
+                '/transform'
+            ]
+
+            url_lower = url.lower()
+            if any(pattern in url_lower for pattern in excluded_patterns):
+                logger.debug(f"URL excluded by pattern filter: {url}")
+                return False
+
+            # Allow known repository domains without full verification
+            trusted_domains = [
+                'zenodo.org/record',
+                'dataverse.harvard.edu',
+                'osf.io',
+                'figshare.com',
+                'pubs.aeaweb.org',  # AER journal pages
+                'econometricsociety.org'  # Econometrica
+            ]
+
+            if any(domain in url_lower for domain in trusted_domains):
+                # For trusted domains, just check if URL is accessible
+                response = self.session.get(url, timeout=10, allow_redirects=True)
+                return response.status_code == 200
+
+            # For other URLs, do full content verification
+            response = self.session.get(url, timeout=10, allow_redirects=True)
+            if response.status_code != 200:
+                return False
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Look for actual content indicators
+            content_indicators = [
+                'download', 'dataset', 'replication', 'supplementary',
+                'code', 'data files', '.zip', '.tar', '.do', '.R', '.py'
+            ]
+
+            page_text = soup.get_text().lower()
+            # Require at least 2 strong indicators
+            matches = sum(1 for indicator in content_indicators if indicator in page_text)
+            return matches >= 2
+
+        except Exception as e:
+            logger.debug(f"URL verification error for {url}: {e}")
+            return False
+
+    def _calculate_title_similarity(self, title1: str, title2: str) -> float:
+        """Calculate similarity between two titles (Jaccard similarity)"""
+        words1 = set(w for w in title1.split() if len(w) > 3)
+        words2 = set(w for w in title2.split() if len(w) > 3)
+
+        if not words1 or not words2:
+            return 0.0
+
+        intersection = len(words1.intersection(words2))
+        union = len(words1.union(words2))
+
+        return intersection / union if union > 0 else 0.0
+
+    def search_osf(self, title: str, doi: str = '') -> Optional[str]:
+        """Search Open Science Framework for replication packages"""
+        try:
+            base_url = 'https://api.osf.io/v2/search/nodes/'
+
+            # Strategy 1: Search by DOI
+            if doi:
+                params = {'q': doi}
+                response = self.session.get(base_url, params=params, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    results = data.get('data', [])
+                    if results:
+                        return results[0].get('links', {}).get('html')
+
+            # Strategy 2: Search by title keywords
+            clean_title = re.sub(r'[^\w\s]', ' ', title).strip()
+            title_words = [w for w in clean_title.split() if len(w) > 3][:6]
+            search_title = ' '.join(title_words)
+
+            params = {'q': search_title}
+            response = self.session.get(base_url, params=params, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get('data', [])
+
+                title_lower = title.lower()
+                for result in results[:3]:
+                    result_title = result.get('attributes', {}).get('title', '').lower()
+                    # More stringent matching
+                    if self._calculate_title_similarity(title_lower, result_title) > 0.6:
+                        return result.get('links', {}).get('html')
+
+        except Exception as e:
+            logger.debug(f"OSF search error: {e}")
+
+        return None
+
     def search_zenodo(self, title: str, authors: str, doi: str = '') -> Optional[str]:
         """Search Zenodo for replication packages using DOI as primary method"""
         try:
-            # Strategy 1: Search by DOI (most accurate)
+            # Strategy 1: Search by DOI (most accurate) - check if DOI is linked in Zenodo metadata
             if doi:
                 # Search for datasets related to this DOI
                 params = {
@@ -93,9 +195,26 @@ class EconomicsJournalScraper:
                 if response.status_code == 200:
                     data = response.json()
                     hits = data.get('hits', {}).get('hits', [])
-                    if hits:
-                        # Return first match with DOI relation
-                        return f"https://zenodo.org/record/{hits[0]['id']}"
+
+                    for hit in hits:
+                        metadata = hit.get('metadata', {})
+
+                        # Check if this dataset explicitly references our DOI in related_identifiers
+                        related_ids = metadata.get('related_identifiers', [])
+                        doi_match = any(
+                            doi.lower() in str(rel_id.get('identifier', '')).lower()
+                            for rel_id in related_ids
+                        )
+
+                        # Also check in description for DOI
+                        description = metadata.get('description', '').lower()
+                        doi_in_description = doi.lower() in description
+
+                        if doi_match or doi_in_description:
+                            url = f"https://zenodo.org/record/{hit['id']}"
+                            # Verify the URL actually has replication content
+                            if self.verify_url_has_content(url):
+                                return url
 
             # Strategy 2: Search by title and author (fallback)
             clean_title = re.sub(r'[^\w\s]', ' ', title).strip()
@@ -112,7 +231,7 @@ class EconomicsJournalScraper:
             params = {
                 'q': query,
                 'type': 'dataset',
-                'size': 3
+                'size': 5
             }
 
             response = self.session.get('https://zenodo.org/api/records', params=params, timeout=3)
@@ -120,18 +239,34 @@ class EconomicsJournalScraper:
                 data = response.json()
                 hits = data.get('hits', {}).get('hits', [])
 
-                # Check if any result is a close match
                 title_lower = title.lower()
                 for hit in hits:
-                    zenodo_title = hit.get('metadata', {}).get('title', '').lower()
-                    # Check for replication package indicators
-                    if 'replication' in zenodo_title or 'data and code' in zenodo_title:
-                        # Verify it's related to our paper
-                        title_words_set = set(w for w in title_lower.split() if len(w) > 3)
-                        zenodo_words_set = set(w for w in zenodo_title.split() if len(w) > 3)
-                        common = len(title_words_set.intersection(zenodo_words_set))
-                        if common >= 3:  # At least 3 common words
-                            return f"https://zenodo.org/record/{hit['id']}"
+                    metadata = hit.get('metadata', {})
+                    zenodo_title = metadata.get('title', '').lower()
+                    zenodo_desc = metadata.get('description', '').lower()
+
+                    # Check for replication indicators
+                    has_replication_keyword = any(kw in zenodo_title or kw in zenodo_desc
+                                                 for kw in ['replication', 'data and code', 'supplementary'])
+
+                    if has_replication_keyword:
+                        # Use better similarity matching
+                        similarity = self._calculate_title_similarity(title_lower, zenodo_title)
+
+                        # Also check if author matches
+                        author_match = False
+                        if authors and authors != 'N/A':
+                            author_last_name = authors.split(';')[0].strip().split()[-1].lower()
+                            zenodo_creators = metadata.get('creators', [])
+                            author_match = any(author_last_name in creator.get('name', '').lower()
+                                             for creator in zenodo_creators)
+
+                        # Require either high title similarity OR author match + moderate similarity
+                        if similarity >= 0.5 or (author_match and similarity >= 0.3):
+                            url = f"https://zenodo.org/record/{hit['id']}"
+                            # Verify before returning
+                            if self.verify_url_has_content(url):
+                                return url
 
         except Exception as e:
             logger.debug(f"Zenodo search error: {e}")
@@ -219,64 +354,251 @@ class EconomicsJournalScraper:
 
         return None
 
-    def search_openicpsr(self, title: str, doi: str = '') -> Optional[str]:
-        """Search openICPSR for replication packages (used by AEA journals)"""
-        try:
-            # openICPSR is frequently used by AEA journals
-            # Simple search based on title
-            clean_title = re.sub(r'[^\w\s]', ' ', title).strip()
-            title_words = [w for w in clean_title.split() if len(w) > 3][:5]
+    def search_openicpsr(self, title: str, doi: str = '', authors: str = '') -> Optional[str]:
+        """Search openICPSR for replication packages (used by AEA journals)
 
-            # Note: openICPSR doesn't have a public API, but we can return likely URL patterns
-            # Many AEA papers have replication packages at openICPSR
-            # Return a search URL as a fallback
-            search_query = '+'.join(title_words)
-            return f"https://www.openicpsr.org/openicpsr/search/studies?q={search_query}"
+        Improved implementation with better matching logic:
+        1. Extract DOI from openICPSR metadata
+        2. Use title similarity scoring
+        3. Match author names
+        """
+        try:
+            # Strategy 1: Try direct DOI-based search in openICPSR
+            if doi:
+                # Try searching for the DOI directly in the study metadata
+                doi_clean = doi.replace('/', '%2F')
+                search_url = f"https://www.openicpsr.org/openicpsr/search/studies?q={doi_clean}"
+
+                try:
+                    response = self.session.get(search_url, timeout=10)
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        study_links = soup.find_all('a', href=re.compile(r'/openicpsr/project/\d+', re.I))
+
+                        if study_links:
+                            # Check if DOI appears in the study page
+                            for link in study_links[:2]:
+                                study_href = link.get('href', '')
+                                if not study_href.startswith('http'):
+                                    study_url = f"https://www.openicpsr.org{study_href}"
+                                else:
+                                    study_url = study_href
+
+                                try:
+                                    study_response = self.session.get(study_url, timeout=8)
+                                    if study_response.status_code == 200:
+                                        study_text = study_response.text.lower()
+                                        # Check if DOI is mentioned on the page
+                                        if doi.lower() in study_text:
+                                            return study_url
+                                except Exception:
+                                    continue
+                except Exception as e:
+                    logger.debug(f"openICPSR DOI search error: {e}")
+
+            # Strategy 2: Search by title with improved matching
+            clean_title = re.sub(r'[^\w\s]', ' ', title).strip()
+            title_words = [w for w in clean_title.split() if len(w) > 3]
+
+            # Use first 5-7 significant words for search
+            search_words = title_words[:min(7, len(title_words))]
+            search_query = '+'.join(search_words)
+            search_url = f"https://www.openicpsr.org/openicpsr/search/studies?q={search_query}"
+
+            response = self.session.get(search_url, timeout=10)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+
+                # Look for study result items - openICPSR has result containers
+                # Find all study links in search results
+                study_links = soup.find_all('a', href=re.compile(r'/openicpsr/project/\d+', re.I))
+
+                if study_links:
+                    # Track best match
+                    best_match = None
+                    best_score = 0
+
+                    for link in study_links[:5]:  # Check top 5 results
+                        study_href = link.get('href', '')
+                        if not study_href.startswith('http'):
+                            study_url = f"https://www.openicpsr.org{study_href}"
+                        else:
+                            study_url = study_href
+
+                        try:
+                            study_response = self.session.get(study_url, timeout=8)
+                            if study_response.status_code == 200:
+                                study_soup = BeautifulSoup(study_response.text, 'html.parser')
+                                study_text = study_soup.get_text().lower()
+
+                                # Extract the study title from the page
+                                study_title_elem = study_soup.find(['h1', 'h2'], class_=re.compile(r'title|study', re.I))
+                                if not study_title_elem:
+                                    # Try alternative selectors
+                                    study_title_elem = study_soup.find('title')
+
+                                study_title = study_title_elem.get_text() if study_title_elem else ''
+
+                                # Calculate similarity score
+                                title_similarity = self._calculate_title_similarity(title.lower(), study_title.lower())
+
+                                # Check for author match
+                                author_match = False
+                                if authors and authors != 'N/A':
+                                    # Get first author's last name
+                                    author_parts = authors.split(';')[0].strip().split()
+                                    if author_parts:
+                                        author_last = author_parts[-1].lower()
+                                        author_match = author_last in study_text
+
+                                # Count title word matches
+                                word_matches = sum(1 for word in title_words if word.lower() in study_text)
+                                word_match_ratio = word_matches / len(title_words) if title_words else 0
+
+                                # Calculate composite score
+                                score = (title_similarity * 0.6) + (word_match_ratio * 0.3) + (0.1 if author_match else 0)
+
+                                # Update best match if this is better
+                                if score > best_score and score >= 0.4:  # Threshold for acceptance
+                                    best_score = score
+                                    best_match = study_url
+
+                        except Exception as e:
+                            logger.debug(f"Error checking openICPSR study {study_url}: {e}")
+                            continue
+
+                    if best_match:
+                        logger.debug(f"openICPSR match found with score {best_score:.2f}: {best_match}")
+                        return best_match
 
         except Exception as e:
             logger.debug(f"openICPSR search error: {e}")
 
         return None
 
+    def check_aer_replication_package(self, doi: str) -> Optional[str]:
+        """
+        Check AER/AEA paper pages for replication package links
+        AER papers are accessible at: https://www.aeaweb.org/articles?id={doi}
+        """
+        try:
+            if not doi:
+                return None
+
+            # Access the AER article page
+            article_url = f"https://www.aeaweb.org/articles?id={doi}"
+            response = self.session.get(article_url, timeout=15)
+
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+
+                # Look for "Replication Package" link
+                # AER papers typically have a link with text "Replication Package"
+                # that points to openICPSR (e.g., https://doi.org/10.3886/E199265V1)
+                all_links = soup.find_all('a', href=True)
+
+                for link in all_links:
+                    link_text = link.get_text().strip().lower()
+
+                    # Check for replication package link
+                    if 'replication package' in link_text or 'replication data' in link_text:
+                        href = link['href']
+
+                        # Make sure it's a full URL
+                        if not href.startswith('http'):
+                            href = f"https://www.aeaweb.org{href}"
+
+                        # Verify it's a valid replication link (openICPSR, dataverse, etc.)
+                        if any(repo in href.lower() for repo in ['doi.org/10.3886', 'openicpsr', 'dataverse', 'zenodo', 'osf.io']):
+                            logger.debug(f"Found AER replication package: {href}")
+                            return href
+
+                # Also check for direct openICPSR project links in the HTML
+                icpsr_pattern = re.compile(r'https?://(?:www\.)?openicpsr\.org/openicpsr/project/(\d+)', re.I)
+                icpsr_matches = icpsr_pattern.findall(response.text)
+
+                if icpsr_matches:
+                    # Return the first openICPSR project URL
+                    project_id = icpsr_matches[0]
+                    return f"https://www.openicpsr.org/openicpsr/project/{project_id}"
+
+        except Exception as e:
+            logger.debug(f"AER replication check error for {doi}: {e}")
+
+        return None
+
     def check_journal_supporting_info(self, doi: str, journal: str) -> Optional[str]:
-        """Check for supporting information on journal websites"""
+        """Check for supporting information on journal websites with actual verification"""
         try:
             if not doi:
                 return None
 
             # American Economic Association journals (AER, etc.)
             if 'American Economic Review' in journal:
-                # AEA journals often have data at openICPSR
-                return f"https://doi.org/{doi}#data-availability"
+                # Use the specialized AER checker
+                return self.check_aer_replication_package(doi)
 
             # Quarterly Journal of Economics (Oxford)
             elif 'Quarterly Journal of Economics' in journal:
                 response = self.session.get(f'https://doi.org/{doi}', timeout=10, allow_redirects=True)
                 if response.status_code == 200 and 'academic.oup.com' in response.url:
                     soup = BeautifulSoup(response.text, 'html.parser')
-                    if soup.find_all(string=re.compile(r'Supplementary data|Replication', re.I)):
-                        return f"{response.url}#supplementary-data"
+                    page_text = soup.get_text().lower()
+
+                    # Look for supplementary data section with actual files
+                    supplementary_section = soup.find_all(['section', 'div'], id=re.compile(r'supplementary|additional', re.I))
+                    has_data_files = 'data files' in page_text or 'replication' in page_text
+                    has_download = soup.find_all('a', href=re.compile(r'download|supplementary', re.I))
+
+                    if (supplementary_section and has_data_files) or has_download:
+                        return response.url
 
             # Journal of Political Economy (Chicago)
             elif 'Journal of Political Economy' in journal:
-                # University of Chicago Press journals
-                return f"https://doi.org/{doi}#supplemental"
+                response = self.session.get(f'https://doi.org/{doi}', timeout=10, allow_redirects=True)
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    page_text = soup.get_text().lower()
 
-            # Econometrica (Wiley)
+                    # Check for actual supplemental material with data/code
+                    has_supplement = 'supplement' in page_text or 'appendix' in page_text
+                    has_data_code = 'data' in page_text and ('code' in page_text or 'replication' in page_text)
+                    has_download = soup.find_all('a', href=re.compile(r'supplement|download', re.I))
+
+                    if has_supplement and (has_data_code or has_download):
+                        return response.url
+
+            # Econometrica (Wiley / Econometric Society)
             elif 'Econometrica' in journal:
                 response = self.session.get(f'https://doi.org/{doi}', timeout=10, allow_redirects=True)
                 if response.status_code == 200:
                     soup = BeautifulSoup(response.text, 'html.parser')
-                    if soup.find_all(string=re.compile(r'Supporting Information|Supplement', re.I)):
-                        return f"https://doi.org/{doi}#support-information-section"
+                    page_text = soup.get_text().lower()
+
+                    # Econometrica has strict data/code requirements since 2019
+                    # Check for supplementary material indicators
+                    has_supplementary = 'supplementary material' in page_text or 'supplemental material' in page_text
+                    has_replication = 'replication package' in page_text or 'replication files' in page_text
+                    has_data_code = 'data and code' in page_text
+
+                    # If any of these strong indicators are present, the paper has replication materials
+                    if has_supplementary or has_replication or has_data_code:
+                        return response.url
 
             # Review of Economic Studies (Oxford)
             elif 'Review of Economic Studies' in journal:
                 response = self.session.get(f'https://doi.org/{doi}', timeout=10, allow_redirects=True)
                 if response.status_code == 200 and 'academic.oup.com' in response.url:
                     soup = BeautifulSoup(response.text, 'html.parser')
-                    if soup.find_all(string=re.compile(r'Supplementary|Replication', re.I)):
-                        return f"{response.url}#supplementary-data"
+                    page_text = soup.get_text().lower()
+
+                    # Check for supplementary data with replication materials
+                    supplementary_section = soup.find_all(['section', 'div'], id=re.compile(r'supplementary', re.I))
+                    has_replication = 'replication' in page_text or 'data files' in page_text
+                    has_download = soup.find_all('a', href=re.compile(r'download|supplementary', re.I))
+
+                    if (supplementary_section and has_replication) or (has_download and 'data' in page_text):
+                        return response.url
 
             # Elsevier journals
             elif journal in ['Journal of Economic Theory', 'Journal of Monetary Economics',
@@ -285,8 +607,15 @@ class EconomicsJournalScraper:
                 response = self.session.get(f'https://doi.org/{doi}', timeout=10, allow_redirects=True)
                 if response.status_code == 200 and 'sciencedirect.com' in response.url:
                     soup = BeautifulSoup(response.text, 'html.parser')
-                    if soup.find_all(string=re.compile(r'Supplementary|Data in Brief|Research Data', re.I)):
-                        return f"{response.url}#supplementary-content"
+                    page_text = soup.get_text().lower()
+
+                    # Check for research data or supplementary content
+                    has_research_data = 'research data' in page_text or 'data in brief' in page_text
+                    has_supplementary = soup.find_all(['section', 'div'], class_=re.compile(r'supplement', re.I))
+                    has_download = soup.find_all('a', href=re.compile(r'download|mmc|supplementary', re.I))
+
+                    if (has_research_data or has_supplementary) and has_download:
+                        return response.url
 
         except Exception as e:
             logger.debug(f"Journal supporting info check error: {e}")
@@ -299,6 +628,12 @@ class EconomicsJournalScraper:
         Detect if a paper has a replication package and return its URL
         Returns tuple: (has_package: 0 or 1, package_url: str or empty)
 
+        Hierarchical search strategy:
+        1. Check abstract/title for direct links
+        2. For AER papers: prioritize openICPSR
+        3. For other journals: Zenodo → Harvard Dataverse → OSF → openICPSR
+        4. Check journal websites
+
         Args:
             check_external: If True, search external repositories (slower but more thorough)
         """
@@ -309,72 +644,102 @@ class EconomicsJournalScraper:
         url_pattern = r'https?://[^\s\)\]]+'
         urls = re.findall(url_pattern, text)
 
-        # Check for repository URLs in abstract
+        # Check for repository URLs in abstract and verify them
         for url in urls:
             if any(repo in url.lower() for repo in ['github.com', 'zenodo.org', 'dataverse.harvard.edu',
                                                     'figshare.com', 'osf.io', 'openicpsr.org']):
-                return 1, url
+                # Verify the URL actually works and has content
+                if self.verify_url_has_content(url):
+                    return 1, url
 
         # Check for replication indicators in text
         replication_indicators = [
             'replication package', 'replication code', 'replication data',
-            'supplementary material', 'supplemental material', 'online appendix',
             'data and code', 'github.com/', 'dataverse', 'zenodo', 'osf.io', 'openicpsr'
         ]
 
         has_indicators = any(indicator in text for indicator in replication_indicators)
 
-        # For AEA journals, most recent papers have data requirements
-        if 'American Economic Review' in journal and doi:
-            # AEA has strict data availability requirements
-            return 1, f"https://doi.org/{doi}#data-availability"
-
-        # For other top journals with known patterns
-        if doi:
-            # QJE often has replication packages
-            if 'Quarterly Journal of Economics' in journal and ('supplement' in text or 'replication' in text):
-                return 1, f"https://doi.org/{doi}#supplementary-data"
-
-            # Econometrica requires data/code
-            if 'Econometrica' in journal:
-                return 1, f"https://doi.org/{doi}#support-information-section"
-
-        # Search for replication packages in external repositories (only if enabled)
+        # Search for replication packages in external repositories
         if check_external:
-            # Try external searches only if there are indicators or for specific journals
             should_search_external = (
                 has_indicators or
                 'replication' in text or
                 'data' in text or
                 'code' in text or
-                'supplement' in text or
-                journal in ['American Economic Review', 'Quarterly Journal of Economics', 'Econometrica']
+                'supplement' in text
             )
 
-            if should_search_external:
-                # 1. Search Zenodo (pass DOI for better matching)
-                zenodo_url = self.search_zenodo(title, authors, doi)
-                if zenodo_url:
-                    return 1, zenodo_url
+            if should_search_external or True:  # Always search for better coverage
+                # HIERARCHICAL SEARCH STRATEGY
+                # For American Economic Review and AEA journals: prioritize openICPSR
+                is_aea_journal = any(j in journal for j in ['American Economic Review', 'AEA',
+                                                              'American Economic Journal',
+                                                              'Journal of Economic Literature',
+                                                              'Journal of Economic Perspectives'])
 
-                # 2. Search Harvard Dataverse (DOI is already passed)
-                dataverse_url = self.search_harvard_dataverse(title, doi, authors)
-                if dataverse_url:
-                    return 1, dataverse_url
+                if is_aea_journal:
+                    # AEA journals primarily use openICPSR
+                    logger.debug(f"AEA journal detected: {journal}. Checking AER page first.")
 
-                # 3. Check openICPSR for AEA journals
-                if 'American Economic' in journal:
-                    icpsr_url = self.search_openicpsr(title, doi)
+                    # 1. Check AER paper page first (most reliable for AER)
+                    if doi and 'American Economic Review' in journal:
+                        aer_url = self.check_aer_replication_package(doi)
+                        if aer_url:
+                            return 1, aer_url
+
+                    # 2. Search openICPSR directly (fallback)
+                    icpsr_url = self.search_openicpsr(title, doi, authors)
                     if icpsr_url:
                         return 1, icpsr_url
 
-        # If we found indicators but no specific URL, return generic indicator
-        if has_indicators:
-            if doi:
-                # Return DOI link as fallback
-                return 1, f"https://doi.org/{doi}#supplementary"
-            return 1, "Available (check paper for details)"
+                    # 3. Fallback to Zenodo (some authors upload there too)
+                    zenodo_url = self.search_zenodo(title, authors, doi)
+                    if zenodo_url:
+                        return 1, zenodo_url
 
+                    # 3. Harvard Dataverse
+                    dataverse_url = self.search_harvard_dataverse(title, doi, authors)
+                    if dataverse_url:
+                        return 1, dataverse_url
+
+                    # 4. OSF
+                    osf_url = self.search_osf(title, doi)
+                    if osf_url:
+                        return 1, osf_url
+
+                else:
+                    # For non-AEA journals: Zenodo → Dataverse → OSF → openICPSR
+                    # Zenodo is most commonly used for general economics papers
+
+                    # 1. Search Zenodo (most popular for European/international journals)
+                    zenodo_url = self.search_zenodo(title, authors, doi)
+                    if zenodo_url:
+                        return 1, zenodo_url
+
+                    # 2. Search Harvard Dataverse (popular in US)
+                    dataverse_url = self.search_harvard_dataverse(title, doi, authors)
+                    if dataverse_url:
+                        return 1, dataverse_url
+
+                    # 3. Search OSF
+                    osf_url = self.search_osf(title, doi)
+                    if osf_url:
+                        return 1, osf_url
+
+                    # 4. Try openICPSR as last resort (less common but some non-AEA use it)
+                    icpsr_url = self.search_openicpsr(title, doi, authors)
+                    if icpsr_url:
+                        return 1, icpsr_url
+
+            # 5. ALWAYS check journal page (works for Econometrica, QJE, RES, etc.)
+            # This runs regardless of text content since abstracts may be missing
+            if doi:
+                journal_url = self.check_journal_supporting_info(doi, journal)
+                if journal_url and self.verify_url_has_content(journal_url):
+                    return 1, journal_url
+
+        # Don't return false positives - only return 1 if we found and verified something
         return 0, ''
 
     def classify_paper_topic(self, title: str, abstract: str) -> str:
