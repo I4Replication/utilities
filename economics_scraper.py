@@ -776,11 +776,17 @@ class EconomicsJournalScraper:
         return 'general_economics'
 
     def scrape_journal(self, journal_name: str, start_year: int, end_year: int,
-                      min_papers: int = 10, check_external_repos: bool = True) -> List[Dict]:
+                      min_papers: int = 10, check_external_repos: bool = True,
+                      num_papers: Optional[int] = None) -> List[Dict]:
         """Scrape papers from a single journal
 
         Args:
-            check_external_repos: If True, search Zenodo and Harvard Dataverse for replication packages
+            journal_name: Name of the journal to scrape
+            start_year: Starting year for papers
+            end_year: Ending year for papers
+            min_papers: Minimum number of papers to collect (default: 10)
+            check_external_repos: If True, search external repositories for replication packages
+            num_papers: If specified, collect exactly this many papers (overrides min_papers)
         """
         papers = []
         issn = self.journal_issns.get(journal_name)
@@ -791,12 +797,16 @@ class EconomicsJournalScraper:
 
         base_url = 'https://api.crossref.org/works'
 
+        # Use num_papers if specified, otherwise use min_papers
+        target_papers = num_papers if num_papers is not None else min_papers
+
         # Calculate how many papers we need per request
         rows_per_request = 50
         offset = 0
-        max_requests = 10  # Maximum requests to prevent infinite loops
+        max_requests = 20  # Maximum requests to prevent infinite loops
 
         logger.info(f"Scraping {journal_name} (ISSN: {issn}) from {start_year} to {end_year}")
+        logger.info(f"  Target: {target_papers} papers")
 
         for request_num in range(max_requests):
             params = {
@@ -824,8 +834,12 @@ class EconomicsJournalScraper:
                         if paper:
                             papers.append(paper)
 
+                            # If num_papers is specified, stop when we reach exactly that number
+                            if num_papers is not None and len(papers) >= num_papers:
+                                break
+
                     # Check if we have enough papers
-                    if len(papers) >= min_papers:
+                    if len(papers) >= target_papers:
                         logger.info(f"  ✅ Collected {len(papers)} papers for {journal_name}")
                         break
 
@@ -843,8 +857,8 @@ class EconomicsJournalScraper:
                 logger.error(f"  Error fetching data: {e}")
                 break
 
-        if len(papers) < min_papers:
-            logger.warning(f"  ⚠️  Only found {len(papers)} papers for {journal_name} (target: {min_papers})")
+        if len(papers) < target_papers:
+            logger.warning(f"  ⚠️  Only found {len(papers)} papers for {journal_name} (target: {target_papers})")
 
         return papers
 
@@ -917,21 +931,40 @@ class EconomicsJournalScraper:
 
     def scrape_all_journals(self, start_year: int = 2020, end_year: int = 2024,
                            topic: Optional[str] = None, min_papers_per_journal: int = 10,
-                           check_external_repos: bool = True) -> pd.DataFrame:
-        """Scrape all journals"""
+                           check_external_repos: bool = True, num_papers_per_journal: Optional[int] = None) -> pd.DataFrame:
+        """Scrape all journals
+
+        Args:
+            start_year: Starting year for papers
+            end_year: Ending year for papers
+            topic: Filter papers by topic (optional)
+            min_papers_per_journal: Minimum papers per journal (default: 10)
+            check_external_repos: Search external repositories for replication packages
+            num_papers_per_journal: If specified, collect exactly this many papers per journal
+        """
         all_papers = []
         journal_counts = defaultdict(int)
+
+        # Determine target papers per journal
+        target_papers = num_papers_per_journal if num_papers_per_journal is not None else min_papers_per_journal
 
         logger.info(f"\n{'='*70}")
         logger.info(f"Starting scrape: {start_year}-{end_year}")
         logger.info(f"Topic filter: {topic if topic else 'ALL TOPICS (no filter)'}")
-        logger.info(f"Target: {min_papers_per_journal}+ papers per journal")
+        logger.info(f"Target: {target_papers} papers per journal")
         logger.info(f"External repository search: {'ENABLED' if check_external_repos else 'DISABLED'}")
         logger.info(f"{'='*70}\n")
 
         for journal_name in self.journal_issns.keys():
-            papers = self.scrape_journal(journal_name, start_year, end_year,
-                                        min_papers_per_journal * 2, check_external_repos)
+            # If num_papers_per_journal is specified, use it; otherwise fetch more than min to allow for filtering
+            papers = self.scrape_journal(
+                journal_name,
+                start_year,
+                end_year,
+                min_papers=min_papers_per_journal * 2 if num_papers_per_journal is None else target_papers,
+                check_external_repos=check_external_repos,
+                num_papers=num_papers_per_journal
+            )
 
             # Apply topic filter if specified
             if topic and topic in self.topic_keywords:
@@ -1051,14 +1084,31 @@ class EconomicsJournalScraper:
 if __name__ == "__main__":
     scraper = EconomicsJournalScraper()
 
-    # Thorough mode - Including external searches (smaller sample)
+    # Example 1: Scrape a specific number of papers per journal (e.g., exactly 10 papers from each)
+    # df = scraper.scrape_all_journals(
+    #     start_year=2022,
+    #     end_year=2024,
+    #     topic=None,
+    #     num_papers_per_journal=10,  # Collect exactly 10 papers per journal
+    #     check_external_repos=True
+    # )
 
+    # Example 2: Scrape from a single journal with specific number
+    # papers = scraper.scrape_journal(
+    #     journal_name='American Economic Review',
+    #     start_year=2023,
+    #     end_year=2024,
+    #     num_papers=50,  # Collect exactly 50 papers
+    #     check_external_repos=True
+    # )
+
+    # Default: Thorough mode - Including external searches (smaller sample)
     df_thorough = scraper.scrape_all_journals(
         start_year=2022,
-        end_year=2024,
+        end_year=2025,
         topic=None,
-        min_papers_per_journal=3,
-        check_external_repos=True  # Thorough mode with external searches
+        min_papers_per_journal=100,
+        check_external_repos=True
     )
 
     if not df_thorough.empty:

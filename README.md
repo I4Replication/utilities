@@ -36,7 +36,7 @@ A powerful tool for scraping papers from top economics journals and detecting re
 
 **Features:**
 - 🎯 Scrape from 15 top economics journals (AER, QJE, JPE, Econometrica, etc.)
-- 📦 Automatic replication package detection (76% success rate for AER)
+- 📦 Automatic replication package detection (22.2% average across all journals, up to 100% for Econometrica)
 - 🔍 Multi-repository search (openICPSR, Zenodo, Harvard Dataverse, OSF)
 - 📊 Export to Excel with detailed metadata
 - ⚡ Fast and efficient with configurable sample sizes
@@ -48,20 +48,27 @@ from economics_scraper import EconomicsJournalScraper
 
 scraper = EconomicsJournalScraper()
 
-# Scrape 50 papers from American Economic Review
-papers = scraper.scrape_journal(
-    journal_name='American Economic Review',
+# Scrape 100 papers per journal from all top journals
+df = scraper.scrape_all_journals(
     start_year=2022,
-    end_year=2024,
-    num_papers=50,
+    end_year=2025,
+    min_papers_per_journal=100,
     check_external_repos=True
 )
 
-print(f"Collected {len(papers)} papers")
+print(f"Collected {len(df)} papers from {df['journal'].nunique()} journals")
 
 # Check replication package availability
-with_replication = sum(1 for p in papers if p['replication_package'] == 1)
-print(f"Papers with replication: {with_replication}/{len(papers)} ({with_replication*100/len(papers):.1f}%)")
+with_replication = df['replication_package'].sum()
+print(f"Papers with replication: {with_replication}/{len(df)} ({with_replication*100/len(df):.1f}%)")
+
+# Show breakdown by journal
+print("\nBy journal:")
+for journal in df['journal'].unique():
+    journal_df = df[df['journal'] == journal]
+    repl = journal_df['replication_package'].sum()
+    total = len(journal_df)
+    print(f"  {journal}: {repl}/{total} ({repl*100/total:.1f}%)")
 ```
 
 **Supported Journals:**
@@ -106,17 +113,18 @@ scraper.save_to_excel(df, 'research_dataset.xlsx')
 
 2. **Replication Package Analysis:**
 ```python
-# Analyze replication package availability across journals
-papers = scraper.scrape_journal(
-    journal_name='American Economic Review',
+# Analyze replication package availability across all journals
+df = scraper.scrape_all_journals(
     start_year=2022,
-    end_year=2024,
-    num_papers=100,
+    end_year=2025,
+    min_papers_per_journal=100,
     check_external_repos=True
 )
 
-papers_with_repl = [p for p in papers if p['replication_package'] == 1]
-print(f"Found {len(papers_with_repl)} papers with replication packages")
+# Analyze by journal
+repl_by_journal = df.groupby('journal')['replication_package'].agg(['sum', 'count'])
+repl_by_journal['rate'] = (repl_by_journal['sum'] / repl_by_journal['count'] * 100).round(1)
+print(repl_by_journal.sort_values('rate', ascending=False))
 ```
 
 3. **Fast Metadata Collection:**
@@ -170,7 +178,7 @@ python example_usage.py
 The scraper uses a hierarchical search strategy to find replication packages:
 
 **For AER/AEA Journals:**
-1. Check AER paper page directly (76% success rate)
+1. Check AER paper page directly (72.5% success rate for AER)
 2. Search openICPSR
 3. Fallback to Zenodo
 4. Search Harvard Dataverse
@@ -241,23 +249,43 @@ If you encounter a bug or have a feature request:
 
 ### Economics Scraper
 
-Tested on 50 AER papers (2022-2024):
+Tested on 2,855 papers from 15 top journals (2022-2025):
 
 | Metric | Result |
 |--------|--------|
-| **Detection Rate** | 76% (38/50 papers) |
-| **Accuracy** | 100% (no false positives) |
-| **Average Time** | 1.2 seconds per paper |
-| **Success by Source** | openICPSR: 100% |
+| **Overall Detection Rate** | 22.2% (635/2,855 papers) |
+| **Best Performing Journals** | Econometrica: 100%, QJE: 89.6%, AER: 72.5% |
+| **Total Papers Scraped** | 2,855 papers |
+| **Average Time** | ~1.5 seconds per paper |
+
+**Replication Package Availability by Journal:**
+
+| Journal | Papers | With Replication | Rate |
+|---------|--------|-----------------|------|
+| Econometrica | 200 | 200 | 100.0% |
+| Quarterly Journal of Economics | 193 | 173 | 89.6% |
+| American Economic Review | 200 | 145 | 72.5% |
+| Economic Journal | 200 | 54 | 27.0% |
+| Review of Economic Studies | 200 | 41 | 20.5% |
+| Journal of the European Economic Association | 200 | 16 | 8.0% |
+| Journal of Political Economy | 200 | 4 | 2.0% |
+| Review of Economics and Statistics | 200 | 1 | 0.5% |
+| Journal of Development Economics | 200 | 1 | 0.5% |
+| Other Journals (6) | 1,062 | 0 | 0.0% |
+
+**Replication Package Sources:**
+
+The scraper successfully identified replication packages from multiple sources including journal websites, Zenodo (115 packages), and other repositories.
 
 ### Typical Usage Times
 
 | Task | Papers | Time |
 |------|--------|------|
-| Single journal | 50 | ~60 seconds |
-| Single journal | 100 | ~2 minutes |
-| All journals | 10 each | ~4 minutes |
-| All journals | 50 each | ~15 minutes |
+| Single journal | 50 | ~75 seconds |
+| Single journal | 100 | ~2.5 minutes |
+| Single journal | 200 | ~5 minutes |
+| All journals | 100 each | ~30 minutes |
+| All journals (full dataset) | 2,855 total | ~1.2 hours |
 
 *Times include replication package searches. Disable `check_external_repos` for 10x speedup.*
 
@@ -305,9 +333,11 @@ These tools are for research purposes only. Please respect the terms of service 
 
 **Economics Scraper:**
 - ✅ Added `num_papers` parameter for exact paper counts
-- ✅ Fixed AER scraper (0% → 76% success rate)
+- ✅ Comprehensive testing on 2,855 papers from 15 journals
+- ✅ Achieved 100% detection rate for Econometrica, 89.6% for QJE, 72.5% for AER
+- ✅ Overall detection rate of 22.2% across all journals
 - ✅ Improved openICPSR detection
-- ✅ Added hierarchical repository search
+- ✅ Added hierarchical repository search (Zenodo, Dataverse, OSF, journal websites)
 - ✅ Enhanced title matching with Jaccard similarity
 - ✅ Better error handling for 403 errors
 - ✅ Comprehensive documentation
